@@ -1,5 +1,51 @@
-use std::net::UdpSocket;
+use std::convert::TryInto;
+use std::net::{SocketAddr, UdpSocket};
 use std::str;
+
+fn vec_to_array<T, const N: usize>(v: Vec<T>) -> [T; N] {
+    v.try_into()
+        .unwrap_or_else(|v: Vec<T>| panic!("Expected a Vec of length {} but it was {}", N, v.len()))
+}
+
+const MAGIC_COOKIE: u32 = 0x2112A442;
+
+fn create_xor_mapped_address_and_port(address_port: SocketAddr) -> [u8; 8] {
+    let fix0: u8 = 0x0;
+    let family_ipv4: u8 = 0x01;
+
+    let address_port_str = address_port.to_string();
+    let address_port_vec: Vec<&str> = address_port_str.split(':').collect();
+    let address = address_port_vec[0];
+    let port_int: u16 = address_port_vec[1].parse().unwrap();
+
+    let magic_bytes: [u8; 4] = MAGIC_COOKIE.to_be_bytes();
+    let magic_bytes_16bits: [u8; 2] = magic_bytes[0..2].try_into().unwrap();
+    let magic_16bits = u16::from_be_bytes(magic_bytes_16bits);
+
+    let xor_port_u16: u16 = port_int ^ magic_16bits;
+    let xor_port = xor_port_u16.to_be_bytes();
+
+    let address_vec: Vec<&str> = address.split('.').collect();
+    let address_vec_int: Vec<u8> = address_vec
+        .iter()
+        .map(|address| address.parse().unwrap())
+        .collect();
+    let address_array: [u8; 4] = vec_to_array(address_vec_int);
+    let address_int: u32 = u32::from_be_bytes(address_array);
+    let xor_address_u32 = address_int ^ MAGIC_COOKIE;
+    let xor_address = xor_address_u32.to_be_bytes();
+
+    return [
+        fix0,
+        family_ipv4,
+        xor_port[0],
+        xor_port[1],
+        xor_address[0],
+        xor_address[1],
+        xor_address[2],
+        xor_address[3],
+    ];
+}
 
 #[derive(Debug)]
 enum StunMessageClass {
@@ -16,19 +62,6 @@ impl StunMessageClass {
             "01" => StunMessageClass::Indication,
             "10" => StunMessageClass::SuccessResponse,
             "11" => StunMessageClass::ErrorResponse,
-            _ => {
-                eprintln!("error");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    fn class_to_str<'a>(class: StunMessageClass) -> &'a str {
-        match class {
-            StunMessageClass::Request => "00",
-            StunMessageClass::Indication => "01",
-            StunMessageClass::SuccessResponse => "10",
-            StunMessageClass::ErrorResponse => "11",
             _ => {
                 eprintln!("error");
                 std::process::exit(1);
@@ -57,16 +90,16 @@ struct StunMessageType {
 #[derive(Debug)]
 struct StunMessageHeader {
     message_type: StunMessageType,
-    message_length: String,
-    magic_cookie: String,
-    transaction_id: String,
+    message_length: [u8; 2],
+    magic_cookie: [u8; 4],
+    transaction_id: [u8; 12],
 }
 
 #[derive(Debug)]
 struct StunMessageAttribute {
-    attribute_type: String,
-    length: String,
-    value: String,
+    attribute_type: [u8; 2],
+    length: [u8; 2],
+    value: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -76,46 +109,51 @@ struct StunMessage {
 }
 
 impl StunMessage {
-    fn build(&self) -> String {
-        let init = String::from("00");
+    fn build(&self) -> Vec<u8> {
         let class = match self.header.message_type.class {
             StunMessageClass::Request => "00",
             StunMessageClass::Indication => "01",
             StunMessageClass::SuccessResponse => "10",
             StunMessageClass::ErrorResponse => "11",
-            _ => {
-                eprintln!("error");
-                std::process::exit(1);
-            }
         };
-        let c0 = &class[0..1];
-        let c1 = &class[1..];
+        let c1 = &class[0..1];
+        let c0 = &class[1..];
 
         let method = match self.header.message_type.method {
-            StunMessageMethod::Binding => "00001",
-            StunMessageMethod::Allocate => "00011",
-            StunMessageMethod::Refresh => "00100",
-            StunMessageMethod::Send => "00110",
-            StunMessageMethod::Data => "00111",
-            StunMessageMethod::CreatePermission => "01000",
-            StunMessageMethod::ChannelBind => "01001",
-            _ => {
-                eprintln!("error");
-                std::process::exit(1);
-            }
+            StunMessageMethod::Binding => "0001",
+            StunMessageMethod::Allocate => "0011",
+            StunMessageMethod::Refresh => "0100",
+            StunMessageMethod::Send => "0110",
+            StunMessageMethod::Data => "0111",
+            StunMessageMethod::CreatePermission => "1000",
+            StunMessageMethod::ChannelBind => "1001",
         };
 
-        let message_type = String::from("000000") + c1 + "000" + c0 + method;
+        let message_type_str = String::from("0000000") + c1 + "000" + c0 + method;
+        let message_type_u16 = u16::from_str_radix(&*message_type_str, 2).unwrap();
+        let message_type = message_type_u16.to_be_bytes();
 
-        let header = message_type
-            + &*self.header.message_length
-            + &*self.header.magic_cookie
-            + &*self.header.transaction_id;
-        let attribute = self.attribute.attribute_type.clone()
-            + &*self.attribute.length
-            + &*self.attribute.value;
+        let h = &self.header;
+        let mut header: Vec<u8> = message_type
+            .iter()
+            .chain(&h.message_length)
+            .chain(&h.magic_cookie)
+            .chain(&h.transaction_id)
+            .map(|&x| x)
+            .collect();
 
-        return init + &*header + &*attribute;
+        let a = &self.attribute;
+        let mut attribute: Vec<u8> = a
+            .attribute_type
+            .iter()
+            .chain(&a.length)
+            .chain(&a.value)
+            .map(|&x| x)
+            .collect();
+
+        header.append(&mut attribute);
+        let message = header;
+        return message;
     }
 }
 
@@ -123,96 +161,93 @@ pub fn serve(address: &str) -> Result<(), failure::Error> {
     let server_socket = UdpSocket::bind(address)?;
     loop {
         let mut buffer = [0u8; 1024];
-        let (size, src) = server_socket.recv_from(&mut buffer)?;
-        println!("Handling from {}", src);
 
-        // byte列を8bitの配列に直す
-        let bits: Vec<_> = buffer.iter().map(|x| format!("{:0>8b}", x)).collect();
-        let bits_header = &bits[0..20];
-        let bits_attribute = &bits[20..];
+        let (_size, src) = server_socket.recv_from(&mut buffer)?;
 
-        let mut message_type = bits_header[0..2].concat();
-        // println!("message_type: {}", message_type);
+        let header = &buffer[0..20];
+        let attribute = &buffer[20..];
+
+        let message_type_slice: Vec<_> =
+            header[0..2].iter().map(|x| format!("{:0>8b}", x)).collect();
+        let mut message_type = message_type_slice.concat();
+
         let c0 = message_type.remove(11);
         let c1 = message_type.remove(7);
-        // println!("{}, {}", c0, c1);
         let message_class = format!("{}{}", c0, c1);
-        // println!("message_class: {}", message_class);
         let class = StunMessageClass::str_to_class(&*message_class);
-        // println!("{:?}", class);
 
-        // println!("message_type: {}", message_type);
-        let message_type_byte = format!("{:b}", i64::from_str_radix(&*message_type, 2).unwrap());
-        // println!("{:?}", message_type_byte);
-        let method = match &*message_type_byte {
-            "1" => StunMessageMethod::Binding,
-            "11" => StunMessageMethod::Allocate,
-            "100" => StunMessageMethod::Refresh,
-            "110" => StunMessageMethod::Send,
-            "111" => StunMessageMethod::Data,
-            "1000" => StunMessageMethod::CreatePermission,
-            "1001" => StunMessageMethod::ChannelBind,
+        let message_type_int = i64::from_str_radix(&*message_type, 2).unwrap();
+        let method = match message_type_int {
+            1 => StunMessageMethod::Binding,
+            3 => StunMessageMethod::Allocate,
+            4 => StunMessageMethod::Refresh,
+            6 => StunMessageMethod::Send,
+            7 => StunMessageMethod::Data,
+            8 => StunMessageMethod::CreatePermission,
+            9 => StunMessageMethod::ChannelBind,
             _ => {
                 eprintln!("error");
                 std::process::exit(1);
             }
         };
-        // println!("method: {:?}", method);
-
         let message_type = StunMessageType { class, method };
 
-        let message_length = bits_header[2..4].concat();
-        let magic_cookie = bits_header[4..8].concat();
-        let tobe_magic_cookie = format!("{:032b}", 0x2112A442);
-        if (magic_cookie == tobe_magic_cookie) {
-            println!("magic_cookie ok");
-        } else {
-            println!("magic_cookie ng");
+        let message_length_2_bytes: [u8; 2] = header[2..4].try_into().expect("failed to convert");
+        let magic_cookie_4_bytes: [u8; 4] = header[4..8].try_into().expect("failed to convert");
+        let magic_cookie = format!("0x{:X}", u32::from_be_bytes(magic_cookie_4_bytes));
+        if magic_cookie != "0x2112A442" {
+            eprintln!("magic_cookie NG");
+            std::process::exit(1);
         }
-        let transaction_id = bits_header[8..20].concat();
+        let transaction_id_12_bytes: [u8; 12] =
+            header[8..20].try_into().expect("failed to convert");
 
         let message_header = StunMessageHeader {
             message_type,
-            message_length,
-            magic_cookie,
-            transaction_id,
+            message_length: message_length_2_bytes,
+            magic_cookie: magic_cookie_4_bytes,
+            transaction_id: transaction_id_12_bytes,
         };
-        println!("message_header: {:?}", message_header);
 
-        let attribute_type = bits_attribute[0..2].concat();
-        let attribute_length = bits_attribute[2..4].concat();
-        let attribute_value = bits_attribute[4..].concat();
+        let attribute_type: [u8; 2] = attribute[0..2].try_into().expect("failed to convert");
+        let attribute_length: [u8; 2] = attribute[2..4].try_into().expect("failed to convert");
+        let attribute_value: Vec<u8> = attribute[4..].try_into().expect("failed to convert");
         let message_attribute = StunMessageAttribute {
             attribute_type,
             length: attribute_length,
             value: attribute_value,
         };
-        println!("message_attribute: {:?}", message_attribute);
+        let requested_message = StunMessage {
+            header: message_header,
+            attribute: message_attribute,
+        };
+        println!("requested_message: {:?}", requested_message);
+
+        // RESPONSE
 
         let response_header = StunMessageHeader {
             message_type: StunMessageType {
                 class: StunMessageClass::SuccessResponse,
                 method: StunMessageMethod::Binding,
             },
-            message_length: "".to_string(),
-            magic_cookie: tobe_magic_cookie.to_string(),
-            transaction_id: "".to_string(),
+            message_length: [0, 12],
+            magic_cookie: (0x2112A442 as u32).to_be_bytes(),
+            transaction_id: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], // TODO
         };
 
-        let xor_mapped_address_type = format!("{:016b}", 0x0020);
+        let xor_mapped_address_type = (0x0020 as u16).to_be_bytes();
 
         let response_attribute = StunMessageAttribute {
             attribute_type: xor_mapped_address_type,
-            length: String::from("0000000000010000"),
-            value: String::from(""),
+            length: (8 as u16).to_be_bytes(),
+            value: create_xor_mapped_address_and_port(src).to_vec(),
         };
         let response_message = StunMessage {
             header: response_header,
             attribute: response_attribute,
         };
+        let res = StunMessage::build(&response_message);
 
-        let response_message_str = StunMessage::build(&response_message);
-
-        server_socket.send_to(&buffer, src)?;
+        server_socket.send_to(&res, src)?;
     }
 }
