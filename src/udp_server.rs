@@ -232,7 +232,7 @@ pub fn serve(address: &str) -> Result<(), failure::Error> {
             },
             message_length: [0, 12],
             magic_cookie: (0x2112A442 as u32).to_be_bytes(),
-            transaction_id: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], // TODO
+            transaction_id: transaction_id_12_bytes
         };
 
         let xor_mapped_address_type = (0x0020 as u16).to_be_bytes();
