@@ -219,31 +219,37 @@ pub fn serve(address_port: &str) -> Result<(), failure::Error> {
         let requested_message = StunMessage::parse(&buffer);
         println!("requested_message: {:?}", requested_message);
 
-        //もし、binding requestならば
+        if matches!(
+            requested_message.header.message_type.class,
+            StunMessageClass::Request
+        ) && matches!(
+            requested_message.header.message_type.method,
+            StunMessageMethod::Binding
+        ) {
+            let response_header = StunMessageHeader {
+                message_type: StunMessageType {
+                    class: StunMessageClass::SuccessResponse,
+                    method: StunMessageMethod::Binding,
+                },
+                message_length: [0, 12],
+                magic_cookie: (MAGIC_COOKIE as u32).to_be_bytes(),
+                transaction_id: requested_message.header.transaction_id,
+            };
 
-        let response_header = StunMessageHeader {
-            message_type: StunMessageType {
-                class: StunMessageClass::SuccessResponse,
-                method: StunMessageMethod::Binding,
-            },
-            message_length: [0, 12],
-            magic_cookie: (MAGIC_COOKIE as u32).to_be_bytes(),
-            transaction_id: requested_message.header.transaction_id,
-        };
+            let xor_mapped_address_type = (0x0020 as u16).to_be_bytes();
 
-        let xor_mapped_address_type = (0x0020 as u16).to_be_bytes();
+            let response_attribute = StunMessageAttribute {
+                attribute_type: xor_mapped_address_type,
+                length: (8 as u16).to_be_bytes(),
+                value: create_xor_mapped_address_and_port(src).to_vec(),
+            };
+            let response_message = StunMessage {
+                header: response_header,
+                attribute: response_attribute,
+            };
+            let res = StunMessage::build(&response_message);
 
-        let response_attribute = StunMessageAttribute {
-            attribute_type: xor_mapped_address_type,
-            length: (8 as u16).to_be_bytes(),
-            value: create_xor_mapped_address_and_port(src).to_vec(),
-        };
-        let response_message = StunMessage {
-            header: response_header,
-            attribute: response_attribute,
-        };
-        let res = StunMessage::build(&response_message);
-
-        server_socket.send_to(&res, src)?;
+            server_socket.send_to(&res, src)?;
+        }
     }
 }
