@@ -1,21 +1,22 @@
 use crate::util;
+use anyhow::{bail, ensure, Result};
 use std::convert::TryInto;
 use std::net::{SocketAddr, UdpSocket};
 use std::str;
 
 const MAGIC_COOKIE: u32 = 0x2112A442;
 
-fn create_xor_mapped_address_and_port(address_port: SocketAddr) -> [u8; 8] {
+fn create_xor_mapped_address_and_port(address_port: SocketAddr) -> Result<[u8; 8]> {
     let fix0: u8 = 0x0;
     let family_ipv4: u8 = 0x01;
 
     let address_port_str = address_port.to_string();
     let address_port_vec: Vec<&str> = address_port_str.split(':').collect();
     let address = address_port_vec[0];
-    let port_int: u16 = address_port_vec[1].parse().unwrap();
+    let port_int: u16 = address_port_vec[1].parse()?;
 
     let magic_bytes: [u8; 4] = MAGIC_COOKIE.to_be_bytes();
-    let magic_bytes_16bits: [u8; 2] = magic_bytes[0..2].try_into().unwrap();
+    let magic_bytes_16bits: [u8; 2] = magic_bytes[0..2].try_into()?;
     let magic_16bits = u16::from_be_bytes(magic_bytes_16bits);
 
     let xor_port_u16: u16 = port_int ^ magic_16bits;
@@ -24,14 +25,14 @@ fn create_xor_mapped_address_and_port(address_port: SocketAddr) -> [u8; 8] {
     let address_vec: Vec<&str> = address.split('.').collect();
     let address_vec_int: Vec<u8> = address_vec
         .iter()
-        .map(|address| address.parse().unwrap())
+        .flat_map(|address| address.parse())
         .collect();
     let address_array: [u8; 4] = util::vec_to_array(address_vec_int);
     let address_int: u32 = u32::from_be_bytes(address_array);
     let xor_address_u32 = address_int ^ MAGIC_COOKIE;
     let xor_address = xor_address_u32.to_be_bytes();
 
-    return [
+    return Ok([
         fix0,
         family_ipv4,
         xor_port[0],
@@ -40,7 +41,7 @@ fn create_xor_mapped_address_and_port(address_port: SocketAddr) -> [u8; 8] {
         xor_address[1],
         xor_address[2],
         xor_address[3],
-    ];
+    ]);
 }
 
 #[derive(Debug)]
@@ -52,16 +53,17 @@ enum StunMessageClass {
 }
 
 impl StunMessageClass {
-    fn str_to_class(str: &str) -> StunMessageClass {
-        match str {
-            "00" => StunMessageClass::Request,
-            "01" => StunMessageClass::Indication,
-            "10" => StunMessageClass::SuccessResponse,
-            "11" => StunMessageClass::ErrorResponse,
-            _ => {
-                eprintln!("error");
-                std::process::exit(1);
-            }
+    fn str_to_class(str: &str) -> Result<StunMessageClass> {
+        if str == "00" {
+            Ok(StunMessageClass::Request)
+        } else if str == "01" {
+            Ok(StunMessageClass::Indication)
+        } else if str == "10" {
+            Ok(StunMessageClass::SuccessResponse)
+        } else if str == "11" {
+            Ok(StunMessageClass::ErrorResponse)
+        } else {
+            bail!("STUN message class NG")
         }
     }
 }
@@ -75,6 +77,27 @@ enum StunMessageMethod {
     Data,
     CreatePermission,
     ChannelBind,
+}
+impl StunMessageMethod {
+    fn int_to_class(i: u8) -> Result<StunMessageMethod> {
+        if i == 1 {
+            Ok(StunMessageMethod::Binding)
+        } else if i == 3 {
+            Ok(StunMessageMethod::Allocate)
+        } else if i == 4 {
+            Ok(StunMessageMethod::Refresh)
+        } else if i == 6 {
+            Ok(StunMessageMethod::Send)
+        } else if i == 7 {
+            Ok(StunMessageMethod::Data)
+        } else if i == 8 {
+            Ok(StunMessageMethod::CreatePermission)
+        } else if i == 9 {
+            Ok(StunMessageMethod::ChannelBind)
+        } else {
+            bail!("STUN message class NG")
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -105,7 +128,7 @@ struct StunMessage {
 }
 
 impl StunMessage {
-    fn parse(buffer: &[u8; 1024]) -> StunMessage {
+    fn parse(buffer: &[u8; 1024]) -> Result<StunMessage> {
         let header = &buffer[0..20];
         let attribute = &buffer[20..];
 
@@ -116,30 +139,20 @@ impl StunMessage {
         let c0 = message_type.remove(11);
         let c1 = message_type.remove(7);
         let message_class = format!("{}{}", c0, c1);
-        let class = StunMessageClass::str_to_class(&*message_class);
+        let class = StunMessageClass::str_to_class(&*message_class)?;
 
-        let message_type_int = i64::from_str_radix(&*message_type, 2).unwrap();
-        let method = match message_type_int {
-            1 => StunMessageMethod::Binding,
-            3 => StunMessageMethod::Allocate,
-            4 => StunMessageMethod::Refresh,
-            6 => StunMessageMethod::Send,
-            7 => StunMessageMethod::Data,
-            8 => StunMessageMethod::CreatePermission,
-            9 => StunMessageMethod::ChannelBind,
-            _ => {
-                eprintln!("error");
-                std::process::exit(1);
-            }
-        };
+        let message_type_int = u8::from_str_radix(&*message_type, 2)?;
+        let method = StunMessageMethod::int_to_class(message_type_int)?;
         let message_type = StunMessageType { class, method };
 
-        let message_length_2_bytes: [u8; 2] = header[2..4].try_into().expect("failed to convert");
-        let magic_cookie_4_bytes: [u8; 4] = header[4..8].try_into().expect("failed to convert");
-        if magic_cookie_4_bytes != MAGIC_COOKIE.to_be_bytes() {
-            eprintln!("magic_cookie NG");
-            std::process::exit(1);
-        }
+        let message_length_2_bytes: [u8; 2] = header[2..4].try_into()?;
+
+        let magic_cookie_4_bytes: [u8; 4] = header[4..8].try_into()?;
+        ensure!(
+            magic_cookie_4_bytes != MAGIC_COOKIE.to_be_bytes(),
+            "magic cookie NG"
+        );
+
         let transaction_id_12_bytes: [u8; 12] =
             header[8..20].try_into().expect("failed to convert");
 
@@ -150,18 +163,18 @@ impl StunMessage {
             transaction_id: transaction_id_12_bytes,
         };
 
-        let attribute_type: [u8; 2] = attribute[0..2].try_into().expect("failed to convert");
-        let attribute_length: [u8; 2] = attribute[2..4].try_into().expect("failed to convert");
-        let attribute_value: Vec<u8> = attribute[4..].try_into().expect("failed to convert");
+        let attribute_type: [u8; 2] = attribute[0..2].try_into()?;
+        let attribute_length: [u8; 2] = attribute[2..4].try_into()?;
+        let attribute_value: Vec<u8> = attribute[4..].try_into()?;
         let message_attribute = StunMessageAttribute {
             attribute_type,
             length: attribute_length,
             value: attribute_value,
         };
-        return StunMessage {
+        return Ok(StunMessage {
             header: message_header,
             attribute: message_attribute,
-        };
+        });
     }
     fn build(&self) -> Vec<u8> {
         let class = match self.header.message_type.class {
@@ -211,45 +224,51 @@ impl StunMessage {
     }
 }
 
-pub fn serve(address_port: &str) -> Result<(), failure::Error> {
+fn receive_and_send(server_socket: &UdpSocket) -> Result<()> {
+    let mut buffer = [0u8; 1024];
+    let (_size, src) = server_socket.recv_from(&mut buffer)?;
+    let requested_message = StunMessage::parse(&buffer)?;
+    println!("requested_message: {:?}", requested_message);
+
+    let xor_mapped_address = create_xor_mapped_address_and_port(src)?;
+
+    if matches!(
+        requested_message.header.message_type.class,
+        StunMessageClass::Request
+    ) && matches!(
+        requested_message.header.message_type.method,
+        StunMessageMethod::Binding
+    ) {
+        let response_header = StunMessageHeader {
+            message_type: StunMessageType {
+                class: StunMessageClass::SuccessResponse,
+                method: StunMessageMethod::Binding,
+            },
+            message_length: [0, 12],
+            magic_cookie: (MAGIC_COOKIE as u32).to_be_bytes(),
+            transaction_id: requested_message.header.transaction_id,
+        };
+
+        let xor_mapped_address_type = (0x0020 as u16).to_be_bytes();
+        let response_attribute = StunMessageAttribute {
+            attribute_type: xor_mapped_address_type,
+            length: (8 as u16).to_be_bytes(),
+            value: xor_mapped_address.to_vec(),
+        };
+        let response_message = StunMessage {
+            header: response_header,
+            attribute: response_attribute,
+        };
+        let res = StunMessage::build(&response_message);
+
+        server_socket.send_to(&res, src)?;
+    }
+    Ok(())
+}
+
+pub fn serve(address_port: &str) -> Result<()> {
     let server_socket = UdpSocket::bind(address_port)?;
     loop {
-        let mut buffer = [0u8; 1024];
-        let (_size, src) = server_socket.recv_from(&mut buffer)?;
-        let requested_message = StunMessage::parse(&buffer);
-        println!("requested_message: {:?}", requested_message);
-
-        if matches!(
-            requested_message.header.message_type.class,
-            StunMessageClass::Request
-        ) && matches!(
-            requested_message.header.message_type.method,
-            StunMessageMethod::Binding
-        ) {
-            let response_header = StunMessageHeader {
-                message_type: StunMessageType {
-                    class: StunMessageClass::SuccessResponse,
-                    method: StunMessageMethod::Binding,
-                },
-                message_length: [0, 12],
-                magic_cookie: (MAGIC_COOKIE as u32).to_be_bytes(),
-                transaction_id: requested_message.header.transaction_id,
-            };
-
-            let xor_mapped_address_type = (0x0020 as u16).to_be_bytes();
-
-            let response_attribute = StunMessageAttribute {
-                attribute_type: xor_mapped_address_type,
-                length: (8 as u16).to_be_bytes(),
-                value: create_xor_mapped_address_and_port(src).to_vec(),
-            };
-            let response_message = StunMessage {
-                header: response_header,
-                attribute: response_attribute,
-            };
-            let res = StunMessage::build(&response_message);
-
-            server_socket.send_to(&res, src)?;
-        }
+        let _ = receive_and_send(&server_socket).map_err(|e| println!("{:#?}", e));
     }
 }
