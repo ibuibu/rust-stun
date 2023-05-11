@@ -149,7 +149,7 @@ impl StunMessage {
 
         let magic_cookie_4_bytes: [u8; 4] = header[4..8].try_into()?;
         ensure!(
-            magic_cookie_4_bytes != MAGIC_COOKIE.to_be_bytes(),
+            magic_cookie_4_bytes == MAGIC_COOKIE.to_be_bytes(),
             "magic cookie NG"
         );
 
